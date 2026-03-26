@@ -1,68 +1,56 @@
 from typing import List, Dict, Any
-from langchain_openai import ChatOpenAI
-from langchain.chains import ConversationalRetrievalChain
-from langchain.memory import ConversationBufferMemory
-from langchain.schema import HumanMessage, AIMessage
+from llama_index.core import PromptTemplate
+from llama_index.core.query_engine import RetrieverQueryEngine
+from llama_index.core.callbacks import CallbackManager
 
-from rag.retriever import Retriever
 from app.config import get_settings
 
 
-class RAGChain:
-    """RAG 对话链 - 结合 LangChain 和 LlamaIndex"""
+# 自定义 QA 提示模板
+QA_TEMPLATE = """<context>
+已知信息如下：
+{context_str}
 
-    def __init__(self, retriever: Retriever):
+</context>
+问题: {query_str}
+
+根据已知信息回答问题。如果无法从已知信息中找到答案，请如实说明。"""
+
+
+class RAGChain:
+    """RAG 对话链 - 使用 LlamaIndex 原生查询引擎"""
+
+    def __init__(self, retriever):
         self.settings = get_settings()
         self.retriever = retriever
+        self.query_engine = retriever.get_query_engine()
 
-        # 初始化 LLM
-        self.llm = ChatOpenAI(
-            model_name=self.settings.openai_model,
-            openai_api_key=self.settings.openai_api_key,
-            openai_api_base=self.settings.openai_base_url,
-            temperature=0.7,
-        )
-
-        # 对话记忆
-        self.memory = ConversationBufferMemory(
-            memory_key="chat_history",
-            output_key="answer",
-            return_messages=True,
-        )
-
-        # 构建 RAG 链
-        self.chain = ConversationalRetrievalChain.from_llm(
-            llm=self.llm,
-            retriever=retriever.get_retriever(),
-            memory=self.memory,
-            return_source_documents=True,
-        )
+        # 设置提示模板
+        self.qa_template = PromptTemplate(QA_TEMPLATE)
 
     def chat(self, query: str) -> Dict[str, Any]:
         """对话"""
-        result = self.chain.invoke({"question": query})
+        # 使用查询引擎
+        response = self.query_engine.query(query)
+        
+        # 获取源文档
+        source_docs = []
+        if hasattr(response, 'source_nodes'):
+            for node in response.source_nodes:
+                source_docs.append({
+                    "content": node.node.text if hasattr(node.node, 'text') else str(node.node),
+                    "metadata": node.node.metadata if hasattr(node.node, 'metadata') else {}
+                })
+
         return {
-            "answer": result["answer"],
-            "source_documents": [
-                {
-                    "content": doc.page_content,
-                    "metadata": doc.metadata,
-                }
-                for doc in result.get("source_documents", [])
-            ],
+            "answer": str(response),
+            "source_documents": source_docs,
         }
 
     def reset_memory(self):
-        """重置对话记忆"""
-        self.memory.clear()
+        """重置对话（当前实现使用原生引擎，无需重置）"""
+        pass
 
     def get_chat_history(self) -> List[Dict[str, str]]:
-        """获取对话历史"""
-        messages = self.memory.chat_memory.messages
-        history = []
-        for msg in messages:
-            if isinstance(msg, HumanMessage):
-                history.append({"role": "human", "content": msg.content})
-            elif isinstance(msg, AIMessage):
-                history.append({"role": "ai", "content": msg.content})
-        return history
+        """获取对话历史（当前实现不支持）"""
+        return []
