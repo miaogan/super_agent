@@ -44,7 +44,7 @@ class Indexer:
         storage_context = StorageContext.from_defaults(
             persist_dir=persist_dir
         )
-        index.storage_context.json persist_dir
+        index.storage_context.persist(persist_dir=persist_dir)
 
     def load_index(self, persist_dir: str = None) -> VectorStoreIndex:
         """从磁盘加载索引"""
