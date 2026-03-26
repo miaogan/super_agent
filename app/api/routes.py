@@ -29,6 +29,11 @@ def get_index():
         # 如果索引不存在，加载文档后构建
         documents = loader.load_directory(settings.data_dir)
         if documents:
+            # 先清空旧索引
+            if os.path.exists(settings.index_dir):
+                for f in os.listdir(settings.index_dir):
+                    os.remove(os.path.join(settings.index_dir, f))
+            
             _index = indexer.build_index(documents)
             indexer.save_index(_index)
         else:
@@ -43,10 +48,7 @@ def get_rag_chain() -> RAGChain:
 
     idx = get_index()
     if idx is None:
-        raise HTTPException(
-            status_code=400,
-            detail="No index available. Please add documents first."
-        )
+        return None
 
     if _rag_chain is None:
         retriever = Retriever(idx)
@@ -65,6 +67,7 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     answer: str
     source_documents: List[dict]
+    mode: str  # "rag" or "fallback"
 
 
 class DocumentInfo(BaseModel):
@@ -82,10 +85,12 @@ async def root():
 
 @router.post("/documents", response_model=List[DocumentInfo])
 async def upload_documents(files: List[UploadFile] = File(...)):
-    """上传文档到知识库"""
+    """上传文档到知识库（自动向量化）"""
     settings = get_settings()
     data_dir = settings.data_dir
+    index_dir = settings.index_dir
     os.makedirs(data_dir, exist_ok=True)
+    os.makedirs(index_dir, exist_ok=True)
 
     saved_files = []
 
@@ -102,13 +107,25 @@ async def upload_documents(files: List[UploadFile] = File(...)):
             doc_id=file.filename
         ))
 
-    # 重新构建索引
+    # 重新构建索引（自动向量化）
     global _index, _rag_chain
+    
+    # 清空旧索引
+    if os.path.exists(index_dir):
+        for f in os.listdir(index_dir):
+            try:
+                os.remove(os.path.join(index_dir, f))
+            except Exception:
+                pass
+    
+    _index = None
+    _rag_chain = None
+    
+    # 重新加载并构建索引
     documents = loader.load_directory(data_dir)
     if documents:
         _index = indexer.build_index(documents)
         indexer.save_index(_index)
-        _rag_chain = None  # 重置链
 
     return saved_files
 
@@ -143,19 +160,49 @@ async def delete_document(file_name: str):
 
     # 重新构建索引
     global _index, _rag_chain
+    index_dir = settings.index_dir
+    
+    if os.path.exists(index_dir):
+        for f in os.listdir(index_dir):
+            try:
+                os.remove(os.path.join(index_dir, f))
+            except Exception:
+                pass
+    
+    _index = None
+    _rag_chain = None
+    
     documents = loader.load_directory(settings.data_dir)
     if documents:
         _index = indexer.build_index(documents)
         indexer.save_index(_index)
-        _rag_chain = None
 
     return {"message": f"Deleted {file_name}"}
 
 
 @router.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
-    """问答"""
+    """问答（支持有无索引两种模式）"""
     rag_chain = get_rag_chain()
+
+    if rag_chain is None:
+        # 没有索引时的友好回复
+        settings = get_settings()
+        docs = loader.load_directory(settings.data_dir)
+        
+        if not docs:
+            return ChatResponse(
+                answer="📚 当前知识库为空，请先上传文档后再提问。\n\n您可以通过以下方式添加文档：\n```\ncurl -X POST http://localhost:8000/api/v1/documents -F \"file=@your_file.txt\"\n```",
+                source_documents=[],
+                mode="fallback"
+            )
+        else:
+            # 有文档但未向量化
+            return ChatResponse(
+                answer="🔄 文档已上传，正在处理向量化中，请稍后再试。\n\n如果您刚上传文档，可能需要等待几秒钟完成索引构建。",
+                source_documents=[],
+                mode="fallback"
+            )
 
     if request.reset_memory:
         rag_chain.reset_memory()
@@ -164,7 +211,8 @@ async def chat(request: ChatRequest):
 
     return ChatResponse(
         answer=result["answer"],
-        source_documents=result["source_documents"]
+        source_documents=result["source_documents"],
+        mode="rag"
     )
 
 
@@ -172,6 +220,8 @@ async def chat(request: ChatRequest):
 async def get_chat_history():
     """获取对话历史"""
     rag_chain = get_rag_chain()
+    if rag_chain is None:
+        return {"history": []}
     return {"history": rag_chain.get_chat_history()}
 
 
@@ -179,5 +229,26 @@ async def get_chat_history():
 async def reset_chat():
     """重置对话"""
     rag_chain = get_rag_chain()
-    rag_chain.reset_memory()
+    if rag_chain:
+        rag_chain.reset_memory()
     return {"message": "Chat history cleared"}
+
+
+@router.get("/status")
+async def get_status():
+    """获取系统状态"""
+    settings = get_settings()
+    
+    # 检查文档数量
+    docs = loader.load_directory(settings.data_dir)
+    doc_count = len(docs)
+    
+    # 检查索引状态
+    has_index = os.path.exists(settings.index_dir) and len(os.listdir(settings.index_dir)) > 0
+    
+    return {
+        "document_count": doc_count,
+        "index_ready": has_index,
+        "data_dir": settings.data_dir,
+        "index_dir": settings.index_dir,
+    }
